@@ -1,0 +1,766 @@
+---
+title: "Manchester Under-5 Mortality Disaggregation (2008-2012)"
+geometry: margin=1in
+header-includes:
+  - |
+    ```{=latex}
+    \expandafter\def\csname ver@subfig.sty\endcsname{}
+    \usepackage{graphicx,subcaption}
+    \makeatletter\@ifundefined{subfloat}{\newcommand{\subfloat}[2][need a sub-caption]{\subcaptionbox{#1}{#2} }}{\renewcommand{\subfloat}[2][need a sub-caption]{\subcaptionbox{#1}{#2} }}\makeatother
+    ```
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE,
+  cache = FALSE,fig.height=4, fig.width=5
+)
+options(timeout = 3600)
+options(download.file.method = "libcurl")
+knitr::opts_chunk$set(cache.path = "cache/man/")
+knitr::opts_chunk$set(fig.path = "figure/man/")
+
+knitr::knit_hooks$set(plot = knitr::hook_plot_tex)
+# Use GEOS for polygon ops; avoids s2 loop-duplication topology errors on UK boundaries.
+sf::sf_use_s2(FALSE)
+```
+
+
+```{r install-DAST, echo=TRUE}
+# if (!requireNamespace("DAST", quietly = TRUE)) {
+#   if (!requireNamespace("remotes", quietly = TRUE)) {
+#     install.packages("remotes")
+#   }
+#   remotes::install_github("nripstein/DAST")
+# }
+# 
+# if (!requireNamespace("mapmisc", quietly = TRUE)) {
+#   install.packages("mapmisc")
+# }
+```
+
+```{r libraries, include=FALSE}
+library(dplyr)
+library(tidyr)
+library(data.table)
+library(sf)
+library(terra)
+library(jsonlite)
+library(readr)
+library(readxl)
+library(mapmisc)
+library(DAST)
+library(aghq)
+```
+
+
+```{r config, echo=FALSE}
+years <- 2008:2012
+# LAD codes to include.
+# Manchester = E08000003, Salford = E08000006
+target_lad_codes <- c(
+  "E08000001", "E08000002", "E08000003", "E08000004", "E08000005",
+  "E08000006", "E08000007", "E08000008", "E08000009", "E08000010"
+)
+uk_grid_crs <- 27700
+
+# Set to "100m" if you need that resolution from WorldPop.
+worldpop_res <- "1km"
+# Raster preprocessing controls for memory/performance.
+offset_buffer_m <- 5000
+offset_agg_fact <- 2
+
+# Local data directory.
+data_dir <- "./data"
+dir.create(data_dir, recursive = TRUE, showWarnings = FALSE)
+terra_tmp <- file.path(data_dir, "terra_tmp")
+dir.create(terra_tmp, recursive = TRUE, showWarnings = FALSE)
+terra::terraOptions(tempdir = terra_tmp, memfrac = 0.6, progress = 1)
+
+# ONS deaths archive (covers 2001-2019; includes the 2008-2012 period).
+ons_deaths_zip_url <- paste0(
+  "https://www.ons.gov.uk/file?uri=",
+  "%2Fpeoplepopulationandcommunity%2Fbirthsdeathsandmarriages%2Fdeaths%2Fadhocs%2F",
+  "12626deathsbylowerlayersuperoutputarealsoaenglandandwalesmidyear2001to2019%2F",
+  "deathsbylsoamidyear01to19.zip"
+)
+
+# ONS Open Geography / ArcGIS data sources.
+url_lsoa11_bdy_geojson <- paste0(
+  "https://opendata.arcgis.com/api/v3/datasets/",
+  "02e8d336d6804fbeabe6c972e5a27b16_0/downloads/data?format=geojson&spatialRefId=4326"
+)
+
+url_lsoa01_bdy_geojson <- paste0(
+  "https://opendata.arcgis.com/api/v3/datasets/",
+  "98b573a6f3ea483e97f7e08771624316_0/downloads/data?format=geojson&spatialRefId=4326"
+)
+
+# LSOA(2001) -> LSOA(2011) -> LAD(2011) best-fit lookup (ArcGIS FeatureServer).
+url_lsoa01_to_lsoa11_service <- paste0(
+  "https://services1.arcgis.com/ESMARspQHYMw9BZ9/ArcGIS/rest/services/",
+  "LSOA01_LSOA11_LAD11_EW_LU_ddfe1cd1c2784c9b991cded95bc915a9/FeatureServer/0/query"
+)
+```
+
+## Helpers
+
+```{r helpers, echo=FALSE}
+download_if_missing <- function(url, destfile) {
+  needs_download <- !file.exists(destfile) || isTRUE(file.info(destfile)$size == 0)
+  if (!needs_download) {
+    return(destfile)
+  }
+
+  dir.create(dirname(destfile), recursive = TRUE, showWarnings = FALSE)
+  tmp <- paste0(destfile, ".part")
+  methods <- c("libcurl", "curl", "auto")
+  last_err <- NULL
+
+  for (attempt in 1:4) {
+    for (m in methods) {
+      ok <- tryCatch({
+        if (file.exists(tmp)) file.remove(tmp)
+        suppressWarnings(
+          download.file(
+            url = url,
+            destfile = tmp,
+            mode = "wb",
+            quiet = FALSE,
+            method = m,
+            headers = c("User-Agent" = "R/disagg notebook")
+          )
+        )
+        file.exists(tmp) && file.info(tmp)$size > 0
+      }, error = function(e) {
+        last_err <<- e$message
+        FALSE
+      })
+
+      if (isTRUE(ok)) {
+        if (file.exists(destfile)) file.remove(destfile)
+        file.rename(tmp, destfile)
+        return(destfile)
+      }
+    }
+    Sys.sleep(2 ^ attempt)
+  }
+
+  stop("Failed to download: ", url, if (!is.null(last_err)) paste0(" (last error: ", last_err, ")"))
+}
+
+pick_col <- function(nms, patterns, required = TRUE) {
+  idx <- Reduce(`|`, lapply(patterns, function(p) grepl(p, nms, ignore.case = TRUE)))
+  out <- nms[idx]
+  if (length(out) == 0 && required) {
+    stop("Could not find required column. Patterns tried: ", paste(patterns, collapse = ", "))
+  }
+  if (length(out) == 0) return(NA_character_)
+  out[[1]]
+}
+
+norm_code <- function(x) {
+  toupper(trimws(as.character(x)))
+}
+
+read_ons_deaths_table <- function(zip_path, years_keep = 2008:2012) {
+  zip_tbl <- unzip(zip_path, list = TRUE)
+  inner_name <- zip_tbl$Name[grepl("\\.(csv|xlsx?)$", zip_tbl$Name, ignore.case = TRUE)][1]
+  if (is.na(inner_name)) {
+    stop("No CSV/XLSX death table found inside ", zip_path)
+  }
+
+  extracted <- unzip(zip_path, files = inner_name, exdir = dirname(zip_path), overwrite = TRUE)
+
+  parse_death_table <- function(raw) {
+    nms <- names(raw)
+
+    year_col <- pick_col(nms, c("^year$", "^mid-?year$", "mid.?year", "time"))
+    deaths_u1_col <- pick_col(nms, c("^<\\s*1$", "under\\s*1", "^0\\s*[-to]{0,3}\\s*0$"), required = FALSE)
+    deaths_u4_col <- pick_col(nms, c("^01\\s*[-to]{0,3}\\s*04$", "^1\\s*[-to]{0,3}\\s*4$", "01-04"), required = FALSE)
+    deaths_5_9_col <- pick_col(nms, c("^05\\s*[-to]{0,3}\\s*09$", "^5\\s*[-to]{0,3}\\s*9$", "05-09"), required = FALSE)
+    deaths_10_14_col <- pick_col(nms, c("^10\\s*[-to]{0,3}\\s*14$", "10-14"), required = FALSE)
+    deaths_15_19_col <- pick_col(nms, c("^15\\s*[-to]{0,3}\\s*19$", "15-19"), required = FALSE)
+
+    lsoa01_col <- pick_col(nms, c("lsoa.*2001.*(code|cd)", "lsoa01(cd|code)"), required = FALSE)
+    lsoa11_col <- pick_col(nms, c("lsoa.*2011.*(code|cd)", "lsoa11(cd|code)"), required = FALSE)
+    lsoa_any_col <- pick_col(nms, c("^lsoa(cd|code)$", "lsoa.*(code|cd)$"), required = FALSE)
+
+    year_raw <- as.character(raw[[year_col]])
+    year_parsed <- suppressWarnings(as.integer(year_raw))
+    if (all(is.na(year_parsed))) {
+      year_parsed <- suppressWarnings(as.integer(sub(".*(20[0-9]{2}).*", "\\1", year_raw)))
+    }
+    year_parsed <- data.table::nafill(year_parsed, type = "locf")
+
+    if (any(is.na(c(deaths_u1_col, deaths_u4_col, deaths_5_9_col, deaths_10_14_col, deaths_15_19_col)))) {
+      stop("Could not find one or more 0-19 deaths columns: <1, 01-04, 05-09, 10-14, 15-19.")
+    }
+
+    out <- raw %>%
+      mutate(
+        year = year_parsed,
+        deaths = as.numeric(.data[[deaths_u1_col]]) +
+          as.numeric(.data[[deaths_u4_col]]) +
+          as.numeric(.data[[deaths_5_9_col]]) +
+          as.numeric(.data[[deaths_10_14_col]]) +
+          as.numeric(.data[[deaths_15_19_col]])
+      ) %>%
+      filter(year %in% years_keep)
+
+    out <- out %>%
+      mutate(
+        lsoa01cd = if (!is.na(lsoa01_col)) norm_code(.data[[lsoa01_col]]) else NA_character_,
+        lsoa11cd = if (!is.na(lsoa11_col)) norm_code(.data[[lsoa11_col]]) else NA_character_
+      )
+
+    if (!is.na(lsoa_any_col)) {
+      out <- out %>%
+        mutate(
+          lsoa01cd = if_else(is.na(lsoa01cd), norm_code(.data[[lsoa_any_col]]), lsoa01cd),
+          lsoa11cd = if_else(is.na(lsoa11cd), norm_code(.data[[lsoa_any_col]]), lsoa11cd)
+        )
+    }
+
+    out %>%
+      transmute(year, lsoa01cd, lsoa11cd, deaths) %>%
+      filter(!is.na(deaths))
+  }
+
+  read_xlsx_sheet <- function(sheet_name) {
+    probe <- readxl::read_excel(extracted, sheet = sheet_name, col_names = FALSE, n_max = 80)
+    first_col <- trimws(tolower(as.character(probe[[1]])))
+    header_row <- which(first_col == "mid-year")[1]
+    if (is.na(header_row)) header_row <- 1
+    raw <- as.data.table(readxl::read_excel(extracted, sheet = sheet_name, skip = header_row - 1))
+    parse_death_table(raw)
+  }
+
+  if (grepl("\\.csv$", extracted, ignore.case = TRUE)) {
+    out <- parse_death_table(data.table::fread(extracted))
+  } else {
+    sheets <- readxl::excel_sheets(extracted)
+    persons_sheet <- sheets[grepl("deaths\\s*-\\s*persons|persons", sheets, ignore.case = TRUE)][1]
+    if (is.na(persons_sheet)) persons_sheet <- sheets[[1]]
+    out <- read_xlsx_sheet(persons_sheet)
+  }
+
+  out
+}
+
+fetch_arcgis_attrs <- function(base_query_url, out_fields, where = "1=1", page_size = 100) {
+  fetch_json <- function(url) {
+    tmp <- tempfile(fileext = ".json")
+    on.exit(unlink(tmp), add = TRUE)
+    methods <- c(getOption("download.file.method", "auto"), "curl", "auto")
+    methods <- unique(methods)
+    last_err <- NULL
+
+    for (attempt in 1:4) {
+      for (m in methods) {
+        ok <- tryCatch({
+          if (file.exists(tmp)) file.remove(tmp)
+          suppressWarnings(
+            download.file(
+              url = url,
+              destfile = tmp,
+              mode = "wb",
+              quiet = TRUE,
+              method = m,
+              headers = c("User-Agent" = "R/disagg notebook")
+            )
+          )
+          file.exists(tmp) && file.info(tmp)$size > 0
+        }, error = function(e) {
+          last_err <<- e$message
+          FALSE
+        })
+        if (isTRUE(ok)) {
+          return(jsonlite::fromJSON(tmp, simplifyVector = FALSE))
+        }
+      }
+      Sys.sleep(2 ^ attempt)
+    }
+    stop("ArcGIS download failed for URL: ", substr(url, 1, 140), if (!is.null(last_err)) paste0(" ... (last error: ", last_err, ")"))
+  }
+
+  attrs_to_dt <- function(features) {
+    attrs <- lapply(features, function(f) f$attributes)
+    attrs <- attrs[vapply(attrs, function(x) !is.null(x) && length(x) > 0, logical(1))]
+    if (length(attrs) == 0) return(NULL)
+    rbindlist(lapply(attrs, as.list), fill = TRUE, use.names = TRUE)
+  }
+
+  ids_url <- paste0(
+    base_query_url,
+    "?where=", URLencode(where, reserved = TRUE),
+    "&returnIdsOnly=true&f=pjson"
+  )
+  ids_res <- fetch_json(ids_url)
+
+  if (!is.null(ids_res$error)) {
+    err_msg <- if (!is.null(ids_res$error$message)) ids_res$error$message else "Unknown error"
+    stop("ArcGIS ID query failed: ", err_msg)
+  }
+
+  rows <- list()
+  object_ids <- ids_res$objectIds
+
+  if (!is.null(object_ids) && length(object_ids) > 0) {
+    chunks <- split(object_ids, ceiling(seq_along(object_ids) / page_size))
+    for (i in seq_along(chunks)) {
+      oid_str <- paste(chunks[[i]], collapse = ",")
+      q <- paste0(
+        base_query_url,
+        "?objectIds=", URLencode(oid_str, reserved = TRUE),
+        "&outFields=", URLencode(paste(out_fields, collapse = ","), reserved = TRUE),
+        "&f=pjson&returnGeometry=false"
+      )
+      res <- fetch_json(q)
+      if (!is.null(res$error)) {
+        err_msg <- if (!is.null(res$error$message)) res$error$message else "Unknown error"
+        stop("ArcGIS chunk query failed (chunk ", i, "): ", err_msg)
+      }
+      if (!is.null(res$features) && length(res$features) > 0) {
+        dt <- attrs_to_dt(res$features)
+        if (!is.null(dt)) rows[[length(rows) + 1L]] <- dt
+      }
+    }
+  } else {
+    q <- paste0(
+      base_query_url,
+      "?where=", URLencode(where, reserved = TRUE),
+      "&outFields=", URLencode(paste(out_fields, collapse = ","), reserved = TRUE),
+      "&f=pjson&returnGeometry=false"
+    )
+    res <- fetch_json(q)
+    if (!is.null(res$error)) {
+      err_msg <- if (!is.null(res$error$message)) res$error$message else "Unknown error"
+      stop("ArcGIS query failed: ", err_msg)
+    }
+    if (!is.null(res$features) && length(res$features) > 0) {
+      dt <- attrs_to_dt(res$features)
+      if (!is.null(dt)) rows[[length(rows) + 1L]] <- dt
+    }
+  }
+
+  if (length(rows) == 0) {
+    return(data.table::as.data.table(setNames(replicate(length(out_fields), character(), simplify = FALSE), out_fields)))
+  }
+  rbindlist(rows, fill = TRUE, use.names = TRUE)
+}
+
+pick_first_existing_col <- function(df, candidates) {
+  hit <- candidates[candidates %in% names(df)]
+  if (length(hit) == 0) {
+    stop("None of these columns were found: ", paste(candidates, collapse = ", "))
+  }
+  hit[[1]]
+}
+```
+
+## Download Core Inputs
+
+```{r download-inputs}
+# Boundaries
+lsoa11_geojson <- file.path(data_dir, "lsoa11_bgc_ew.geojson")
+lsoa01_geojson <- file.path(data_dir, "lsoa01_bgc_ew.geojson")
+download_if_missing(url_lsoa11_bdy_geojson, lsoa11_geojson)
+download_if_missing(url_lsoa01_bdy_geojson, lsoa01_geojson)
+
+# Lookups
+lsoa01_to11_rds <- file.path(data_dir, "lsoa01_to11_lookup.rds")
+lookup_ok <- FALSE
+if (file.exists(lsoa01_to11_rds)) {
+  existing_lookup <- tryCatch(readRDS(lsoa01_to11_rds), error = function(e) NULL)
+  if (!is.null(existing_lookup) && all(c("LSOA01CD", "LSOA11CD", "LAD11CD") %in% toupper(names(existing_lookup)))) {
+    lookup_ok <- TRUE
+  }
+}
+
+if (!lookup_ok) {
+  lkp <- fetch_arcgis_attrs(
+    base_query_url = url_lsoa01_to_lsoa11_service,
+    out_fields = c("LSOA01CD", "LSOA11CD", "LAD11CD", "CHGIND")
+  )
+  saveRDS(lkp, lsoa01_to11_rds)
+}
+
+# Deaths archive
+deaths_zip <- file.path(data_dir, "deathsbylsoamidyear01to19.zip")
+download_if_missing(ons_deaths_zip_url, deaths_zip)
+```
+
+## Read and Harmonize Inputs
+
+```{r assemble-data, include=FALSE}
+# Read boundaries
+lsoa11_bdy <- st_read(lsoa11_geojson, quiet = TRUE) %>% st_make_valid()
+lsoa01_bdy <- st_read(lsoa01_geojson, quiet = TRUE) %>% st_make_valid()
+
+# Read lookups
+lsoa01_to11 <- readRDS(lsoa01_to11_rds)
+
+# Standardize lookup names
+setnames(lsoa01_to11, old = names(lsoa01_to11), new = toupper(names(lsoa01_to11)))
+lsoa01_to11 <- lsoa01_to11 %>%
+  mutate(
+    LSOA01CD = norm_code(LSOA01CD),
+    LSOA11CD = norm_code(LSOA11CD),
+    LAD11CD = norm_code(LAD11CD)
+  )
+
+# Manchester LSOAs
+man_lsoa11 <- lsoa01_to11 %>%
+  filter(LAD11CD %in% norm_code(target_lad_codes)) %>%
+  distinct(LSOA11CD) %>%
+  pull(LSOA11CD)
+
+man_lsoa01 <- lsoa01_to11 %>%
+  filter(LAD11CD %in% norm_code(target_lad_codes) | LSOA11CD %in% man_lsoa11) %>%
+  distinct(LSOA01CD) %>%
+  pull(LSOA01CD)
+
+# Subset boundaries to Manchester footprint
+code_col_11 <- pick_first_existing_col(lsoa11_bdy, c("LSOA11CD", "LSOA_CODE", "lsoa11cd", "lsoa11cd"))
+code_col_01 <- pick_first_existing_col(lsoa01_bdy, c("LSOA01CD", "LSOA_CODE", "lsoa01cd", "lsoa01cd"))
+
+lsoa11_mcr <- lsoa11_bdy %>%
+  mutate(LSOA11CD = norm_code(.data[[code_col_11]])) %>%
+  filter(LSOA11CD %in% man_lsoa11) %>%
+  st_transform(uk_grid_crs)
+
+lsoa01_mcr <- lsoa01_bdy %>%
+  mutate(LSOA01CD = norm_code(.data[[code_col_01]])) %>%
+  filter(LSOA01CD %in% man_lsoa01) %>%
+  st_transform(uk_grid_crs)
+
+# Read deaths and standardize columns
+deaths_long <- read_ons_deaths_table(deaths_zip, years_keep = years)
+
+# Aggregate by year + code (safe if raw table has multiple rows per LSOA-year)
+deaths_01 <- deaths_long %>%
+  filter(year <= 2009, !is.na(lsoa01cd)) %>%
+  group_by(year, lsoa01cd) %>%
+  summarise(deaths = sum(deaths), .groups = "drop")
+
+deaths_11 <- deaths_long %>%
+  filter(year >= 2010, !is.na(lsoa01cd)) %>%
+  left_join(
+    lsoa01_to11 %>% distinct(LSOA01CD, LSOA11CD),
+    by = c("lsoa01cd" = "LSOA01CD")
+  ) %>%
+  filter(!is.na(LSOA11CD)) %>%
+  group_by(year, lsoa11cd = LSOA11CD) %>%
+  summarise(deaths = sum(deaths), .groups = "drop")
+```
+
+## WorldPop Under-5 Population Rasters
+
+```{r worldpop-download-and-build, include=FALSE}
+# WorldPop 2000-2020 age/sex grids. Under-5 is approximated as age bands 0 and 1 for both sexes.
+# Filenames used here follow the Global_2000_2020 convention, e.g. gbr_f_0_2008.tif.
+
+wp_base <- "https://data.worldpop.org/GIS/AgeSex_structures/Global_2000_2020"
+ages_u5 <- c(0, 1)
+sexes <- c("f", "m")
+
+worldpop_tbl <- expand.grid(
+  year = years,
+  sex = sexes,
+  age = ages_u5,
+  stringsAsFactors = FALSE
+) %>%
+  as_tibble() %>%
+  mutate(
+    url = sprintf("%s/%s/GBR/gbr_%s_%s_%s.tif", wp_base, year, sex, age, year),
+    file = file.path(data_dir, sprintf("worldpop_gbr_%s_%s_%s.tif", sex, age, year))
+  )
+
+invisible(mapply(download_if_missing, worldpop_tbl$url, worldpop_tbl$file))
+
+# Build yearly under-5 population rasters by summing age-band rasters, then
+# clip/project to Manchester and write file-backed rasters to control memory use.
+lsoa11_vect <- terra::vect(lsoa11_mcr)
+lsoa11_vect <- terra::project(lsoa11_vect, paste0("EPSG:", uk_grid_crs))
+mcr_outline <- terra::aggregate(lsoa11_vect, dissolve = TRUE)
+wp_yearly <- lapply(years, function(yr) {
+  rr <- terra::rast(worldpop_tbl$file[worldpop_tbl$year == yr])
+  r_sum <- terra::app(
+    rr,
+    sum,
+    na.rm = TRUE,
+    filename = file.path(data_dir, sprintf("wp_u5_sum_%s.tif", yr)),
+    overwrite = TRUE,
+    wopt = list(gdal = "COMPRESS=LZW")
+  )
+
+  mcr_native <- terra::project(mcr_outline, terra::crs(r_sum))
+  buffer_native <- if (terra::is.lonlat(mcr_native)) {
+    offset_buffer_m / 111320
+  } else {
+    offset_buffer_m
+  }
+  mcr_native_buf <- terra::buffer(mcr_native, width = buffer_native)
+  r_crop <- terra::crop(
+    r_sum,
+    mcr_native_buf,
+    filename = file.path(data_dir, sprintf("wp_u5_crop_%s.tif", yr)),
+    overwrite = TRUE,
+    wopt = list(gdal = "COMPRESS=LZW")
+  )
+
+  r_proj <- terra::project(
+    r_crop,
+    terra::crs(lsoa11_vect),
+    method = "bilinear",
+    filename = file.path(data_dir, sprintf("wp_u5_proj_%s.tif", yr)),
+    overwrite = TRUE,
+    wopt = list(gdal = "COMPRESS=LZW")
+  )
+
+  r_mask <- terra::mask(
+    r_proj,
+    mcr_outline,
+    filename = file.path(data_dir, sprintf("wp_u5_mask_%s.tif", yr)),
+    overwrite = TRUE,
+    wopt = list(gdal = "COMPRESS=LZW")
+  )
+
+  r_out <- if (!is.null(offset_agg_fact) && offset_agg_fact > 1) {
+    terra::aggregate(
+      r_mask,
+      fact = offset_agg_fact,
+      fun = sum,
+      na.rm = TRUE,
+      filename = file.path(data_dir, sprintf("wp_u5_mask_agg%s_%s.tif", offset_agg_fact, yr)),
+      overwrite = TRUE,
+      wopt = list(gdal = "COMPRESS=LZW")
+    )
+  } else {
+    r_mask
+  }
+
+  # Ensure yearly offsets are explicitly in UK National Grid (same as lsoa11_vect).
+  terra::project(
+    r_out,
+    terra::crs(lsoa11_vect),
+    method = "bilinear",
+    filename = file.path(data_dir, sprintf("wp_u5_ukgrid_%s.tif", yr)),
+    overwrite = TRUE,
+    wopt = list(gdal = "COMPRESS=LZW")
+  )
+})
+names(wp_yearly) <- as.character(years)
+
+# Quick cell-count check for memory diagnostics.
+sapply(wp_yearly, terra::ncell)
+```
+
+```{r plotPop, fig.cap='Population (WorldPop under-5) by year',  fig.subcap = names(wp_yearly), out.width='0.49\\linewidth',  echo=FALSE}
+
+popCol = mapmisc::colourScale(
+  unlist(lapply(wp_yearly, terra::minmax)),
+  breaks= 9, style='equal', transform='sqrt',
+  digits=1, dec=2, col='YlOrRd')
+
+for(D in names(wp_yearly)) {
+  mapmisc::map.new(wp_yearly[[1]])
+  terra::plot(wp_yearly[[D]], breaks=popCol$breaks, col=popCol$col, 
+    legend=FALSE, add=TRUE)
+}
+mapmisc::legendBreaks("bottomleft", popCol, inset=0, bty='n')
+```
+
+## Build Time-Varying Polygon + Offset Lists
+
+```{r build-time-varying-objects, include=FALSE}
+sanitize_poly <- function(x, id_col = "AREA_ID") {
+  x <- sf::st_make_valid(x)
+  x <- sf::st_collection_extract(x, "POLYGON", warn = FALSE)
+  x <- sf::st_make_valid(x)
+  x <- x[!sf::st_is_empty(x), ]
+  if (nrow(x) == 0) return(x)
+  x %>%
+    group_by(.data[[id_col]]) %>%
+    summarise(deaths = sum(deaths, na.rm = TRUE), do_union = TRUE, .groups = "drop")
+}
+
+poly_list <- list()
+offset_list <- list()
+
+for (yr in years) {
+  if (yr <= 2009) {
+    poly_yr <- lsoa01_mcr %>%
+      left_join(deaths_01 %>% filter(year == yr), by = c("LSOA01CD" = "lsoa01cd")) %>%
+      mutate(
+        AREA_ID = LSOA01CD,
+        deaths = replace_na(deaths, 0)
+      )
+  } else {
+    poly_yr <- lsoa11_mcr %>%
+      left_join(deaths_11 %>% filter(year == yr), by = c("LSOA11CD" = "lsoa11cd")) %>%
+      mutate(
+        AREA_ID = LSOA11CD,
+        deaths = replace_na(deaths, 0)
+      )
+  }
+
+  # DAST expects sf polygons and one aggregation raster per time slice.
+  poly_list[[as.character(yr)]] <- sanitize_poly(poly_yr, id_col = "AREA_ID")
+  offset_list[[as.character(yr)]] <- wp_yearly[[as.character(yr)]]
+}
+```
+
+```{r diagnostics}
+# Quick diagnostics
+sapply(poly_list, nrow)
+sapply(poly_list, function(x) sum(x$deaths, na.rm = TRUE))
+```
+
+```{r yearly-input-maps, fig.cap="Yearly observed deaths in Manchester.", fig.subcap=paste("Deaths", years),  out.width='0.49\\linewidth', echo=FALSE}
+years_chr <- as.character(years)
+
+deathsCol = mapmisc::colourScale(
+  breaks=seq(0, 
+    max(sapply(poly_list, function(x) max(x$deaths, na.rm = TRUE)))
+    ),
+  col='YlOrRd',style='fixed')
+
+for (yr in years_chr) {
+  p <- poly_list[[yr]]
+  pv <- terra::vect(p)
+
+  deathsColHere <- mapmisc::colourScale(
+    pv$deaths,
+    breaks = deathsCol$breaks, col=deathsCol$col, 
+    style = "fixed")
+
+  mapmisc::map.new(pv)
+  plot(pv, col = deathsColHere$plot, 
+    border = "grey35", lty = 0, add = TRUE)
+}
+
+  mapmisc::legendBreaks("bottomright", deathsCol, bty = "n", inset=0)
+
+
+```
+
+## Prepare `DAST` Data Object
+
+```{r prepare-disagg-data, cache=TRUE, include=FALSE}
+# Use the first year's bbox to scale mesh defaults.
+bb <- st_bbox(poly_list[[1]])
+hyp <- sqrt((bb$xmax - bb$xmin)^2 + (bb$ymax - bb$ymin)^2)
+maxedge <- hyp / 16
+
+dis_data_mmap <- DAST::prepare_data_mmap(
+  polygon_shapefile_list = poly_list,
+  aggregation_rasters_list = offset_list,
+  response_var = "deaths",
+  id_var = "AREA_ID",
+  na_action = TRUE,
+  verbose = TRUE,
+  mesh_args = list(
+    max.edge = c(maxedge / 5, maxedge),
+    cutoff = 0.2 * maxedge,
+    offset = c(hyp / 16, hyp / 4),
+    resolution = 250
+  )
+)
+```
+
+```{r plotdisdata, eval=FALSE}
+plot(dis_data_mmap)
+```
+
+## Priors and Model  
+
+```{r priors, include=FALSE}
+my_priors <- DAST::get_priors(dis_data_mmap)
+
+# Example customizations similar to disagg.Rmd.
+my_priors$prior_rho_min <- 2500
+my_priors$prior_rho_prob <- 0.5
+my_priors$prior_iideffect_sd_max <- 0.1
+my_priors$prior_iideffect_sd_prob <- 0.5
+```
+
+```{r fit-pooled-nb, cache=TRUE}
+fm_nb_pooled <- DAST::disag_model_mmap(
+  data = dis_data_mmap,
+  family = "negbinomial",
+  link = "log",
+  iid = TRUE,
+  verbose = TRUE,
+  priors = my_priors,
+  engine = "AGHQ",
+  engine.args = list(aghq_k = 1, 
+                     optimizer = "nlminb"),
+  time_varying_betas = FALSE,
+  fixed_effect_betas = TRUE
+)
+```
+
+```{r predict-pooled}
+pred_pooled <- predict(fm_nb_pooled, verbose = TRUE)
+summary(fm_nb_pooled)
+```
+
+## Pooled Maps
+
+```{r pooled-map-build, eval=TRUE}
+# Build posterior median and exceedance (Pr[log-risk > 0]) rasters
+# following the same approach as disagg.Rmd.
+samps <- aghq::sample_marginal(fm_nb_pooled$aghq_model, 500)
+mats <- DAST:::get_predict_matrices(
+  data = fm_nb_pooled$data,
+  new_data = NULL,
+  expected_cov_names = tryCatch(
+    fm_nb_pooled$model_setup$coef_meta$cov_names,
+    error = function(e) NULL
+  ),
+  time_varying_betas = isTRUE(fm_nb_pooled$model_setup$time_varying_betas)
+)
+
+rfield <- mats$A %*% samps$samps
+pred_surface <- terra::rast(
+  as.data.frame(cbind(
+    mats$coords,
+    med = apply(rfield, 1, median),
+    exc = apply(rfield, 1, function(xx) mean(xx > 0))
+  )),
+  crs = terra::crs(terra::vect(lsoa11_mcr))
+)
+
+manchester_outline <- terra::aggregate(terra::vect(lsoa11_mcr), dissolve = TRUE)
+pred_mask <- terra::mask(pred_surface, manchester_outline)
+```
+
+```{r pooled-maps, out.width='0.49\\linewidth', fig.cap='Result maps for Manchester : posterior median (log-risk) and exceedance probability.', fig.subcap = c('est','exc'), echo=FALSE}
+med_col <- mapmisc::colourScale(
+  pred_mask[["med"]],
+  breaks = 8,
+  style = "equal",
+  col = "Spectral",
+  rev = TRUE, digits=1
+)
+exc_col <- mapmisc::colourScale(
+  breaks = c(0, 0.2, 0.5, 0.8, 0.95, 1),
+  style = "fixed",
+  col = "RdYlGn",
+  rev = TRUE
+)
+
+mapmisc::map.new(pred_mask)
+plot(pred_mask[["med"]], col = med_col$col, breaks = med_col$breaks, legend = FALSE, add = TRUE)
+plot(terra::vect(lsoa11_mcr), add = TRUE, border = "grey30", lwd = 0.2)
+mapmisc::legendBreaks("bottomleft", med_col, bty = "n")
+
+mapmisc::map.new(pred_mask)
+plot(pred_mask[["exc"]], col = exc_col$col, breaks = exc_col$breaks, legend = FALSE, add = TRUE)
+plot(terra::vect(lsoa11_mcr), add = TRUE, border = "grey30", lwd = 0.2)
+mapmisc::legendBreaks("bottomleft", exc_col, bty = "n")
+```
