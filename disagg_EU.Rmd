@@ -166,7 +166,7 @@ plot_sf <- function(sf_df, field_name) {
 
 ```{r data-setup, echo=FALSE}
 res_choice <- "1km"  # "1km" or "100m"
-data_dir <- "../data"
+data_dir <- "./data"
 options(timeout = 3600)
 
 Syears <- c(2003, 2006, 2010, 2013, 2016, 2021, 2024)
@@ -370,7 +370,7 @@ aa
 
 
 ```{r pooled-maps, fig.cap='stuff', out.width='0.5\\textwidth'}
-pred_mask = terra::unwrap(predMaskWrap)
+# pred_mask = terra::unwrap(predMaskWrap)
 pred_col <- mapmisc::colourScale(
   pred_mask[["med"]],
   dec = 2,
@@ -536,4 +536,3 @@ summary(fm_nb_k1)
 
 
 
-I would like to replicate the analysis in the file `disagg.Rmd` to estimate the risk of under-5 mortality in Mancheters, UK for 2008 to 2012 using death counts from the ONS at the LSOA level and population from worldpop.  I know the 2008 and 2009 data are on one set of boundaries and 2010 onwards are on a different set.  Please write an RMD file to download and assemble the data in the correct form.  Also include code similar to disagg.Rmd to run the model, but don't run it yet (put eval=FALSE in the chunks)
