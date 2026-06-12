@@ -28,12 +28,12 @@ sf::sf_use_s2(FALSE)
 ```
 
 
-```{r install-disaggmultimap, echo=TRUE}
-if (!requireNamespace("disaggMultiMap", quietly = TRUE)) {
+```{r install-DAST, echo=TRUE}
+if (!requireNamespace("DAST", quietly = TRUE)) {
   if (!requireNamespace("remotes", quietly = TRUE)) {
     install.packages("remotes")
   }
-  remotes::install_github("nripstein/disaggMultiMap")
+  remotes::install_github("nripstein/DAST")
 }
 
 if (!requireNamespace("mapmisc", quietly = TRUE)) {
@@ -51,7 +51,7 @@ library(jsonlite)
 library(readr)
 library(readxl)
 library(mapmisc)
-library(disaggMultiMap)
+library(DAST)
 library(aghq)
 ```
 
@@ -565,8 +565,8 @@ popCol = mapmisc::colourScale(
   unlist(lapply(wp_yearly, terra::minmax)),
   breaks= 9, style='equal', transform='sqrt',
   digits=1, dec=2, col='YlOrRd')
-  breaks= 12, style='equal', transform='log',
-  dec=1, col='YlOrRd')
+  # breaks= 12, style='equal', transform='log',
+  # dec=1, col='YlOrRd')
 
 for(D in names(wp_yearly)) {
   mapmisc::map.new(wp_yearly[[1]])
@@ -610,7 +610,7 @@ for (yr in years) {
       )
   }
 
-  # disaggMultiMap expects sf polygons and one aggregation raster per time slice.
+  # DAST expects sf polygons and one aggregation raster per time slice.
   poly_list[[as.character(yr)]] <- sanitize_poly(poly_yr, id_col = "AREA_ID")
   offset_list[[as.character(yr)]] <- wp_yearly[[as.character(yr)]]
 }
@@ -625,7 +625,7 @@ sapply(poly_list, function(x) table(x$deaths>0))
 
 ```{r yearly-input-maps, fig.cap="Yearly observed deaths in Manchester.", fig.subcap=paste("Deaths", years),  out.width='0.49\\linewidth', echo=FALSE}
 years_chr <- as.character(years)
-```{r yearly-input-maps, fig.cap="Yearly observed deaths in Manchester.", fig.subcap=paste("Deaths", names(poly_list)), fig.show='hold', out.width='0.32\\linewidth', fig.width=4, fig.height=4}
+# ```{r yearly-input-maps, fig.cap="Yearly observed deaths in Manchester.", fig.subcap=paste("Deaths", names(poly_list)), fig.show='hold', out.width='0.32\\linewidth', fig.width=4, fig.height=4}
 years_chr <- names(poly_list)
 
 
@@ -636,9 +636,9 @@ deathsCol = mapmisc::colourScale(
     max(sapply(poly_list, function(x) max(x$deaths, na.rm = TRUE)))
     ),
   col='YlOrRd',style='fixed')
-  as.vector(sapply(poly_list, function(x) range(x$deaths, na.rm = TRUE))),
-  col='YlOrRd', breaks=9, style='equal',
-  transform='sqrt', dec=0, opacity = 0.6)
+  # as.vector(sapply(poly_list, function(x) range(x$deaths, na.rm = TRUE))),
+  # col='YlOrRd', breaks=9, style='equal',
+  # transform='sqrt', dec=0, opacity = 0.6)
 
 for (yr in years_chr) {
   p <- poly_list[[yr]]
@@ -648,8 +648,8 @@ for (yr in years_chr) {
     pv$deaths,
     breaks = deathsCol$breaks, col=deathsCol$col, 
     style = "fixed")
-    pv$deaths,
-    breaks = deathsCol$breaks, col=deathsCol$colOpacity, style = "fixed")
+    # pv$deaths,
+    # breaks = deathsCol$breaks, col=deathsCol$colOpacity, style = "fixed")
 
   mapmisc::map.new(pv)
   plot(pv, col = deathsColHere$plot, 
@@ -661,7 +661,7 @@ for (yr in years_chr) {
   mapmisc::legendBreaks("bottomright", deathsCol, bty = "n", inset=0)
 ```
 
-## Prepare `disaggMultiMap` Data Object
+## Prepare `DAST` Data Object
 
 ```{r prepare-disagg-data, cache=TRUE, include=FALSE}
 # Use the first year's bbox to scale mesh defaults.
@@ -669,7 +669,7 @@ bb <- st_bbox(poly_list[[1]])
 hyp <- sqrt((bb$xmax - bb$xmin)^2 + (bb$ymax - bb$ymin)^2)
 maxedge <- hyp / 16
 
-dis_data_mmap <- disaggMultiMap::prepare_data_mmap(
+dis_data_mmap <- DAST::prepare_data_mmap(
   polygon_shapefile_list = poly_list,
   aggregation_rasters_list = offset_list,
   response_var = "deaths",
@@ -692,7 +692,7 @@ plot(dis_data_mmap)
 ## Priors and Model  
 
 ```{r priors, include=FALSE}
-my_priors <- disaggMultiMap::get_priors(dis_data_mmap)
+my_priors <- DAST::get_priors(dis_data_mmap)
 
 # Example customizations similar to disagg.Rmd.
 my_priors$prior_rho_min <- 2500
@@ -702,7 +702,7 @@ my_priors$prior_iideffect_sd_prob <- 0.5
 ```
 
 ```{r fit-pooled-nb, cache=TRUE}
-fm_nb_pooled <- disaggMultiMap::disag_model_mmap(
+fm_nb_pooled <- DAST::disag_model_mmap(
   data = dis_data_mmap,
   aghq_k = 2,
   family = "negbinomial",
@@ -711,7 +711,7 @@ fm_nb_pooled <- disaggMultiMap::disag_model_mmap(
   verbose = TRUE,
   priors = my_priors,
   engine = "AGHQ",
-  time_varying_betas = FALSE
+  time_varying_betas = TRUE
 )
 ```
 
@@ -726,7 +726,7 @@ summary(fm_nb_pooled)
 # Build posterior median and exceedance (Pr[log-risk > 0]) rasters
 # following the same approach as disagg.Rmd.
 samps <- aghq::sample_marginal(fm_nb_pooled$aghq_model, 500)
-mats <- disaggMultiMap:::get_predict_matrices(
+mats <- DAST:::get_predict_matrices(
   data = fm_nb_pooled$data,
   new_data = NULL,
   expected_cov_names = tryCatch(
