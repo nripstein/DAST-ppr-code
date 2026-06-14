@@ -30,7 +30,7 @@ library(dplyr)
 library(tidyr)
 library(Matrix)
 library(aghq)
-library(disaggMultiMap)
+library(DAST)
 library(terra)
 library(sf)
 library(data.table)
@@ -278,7 +278,7 @@ hypotenuse <- sqrt((limits$xmax - limits$xmin)^2 + (limits$ymax - limits$ymin)^2
 maxedge <- hypotenuse / 10
 
 prep_time <- system.time({
-  dis_data_mmap <- disaggMultiMap::prepare_data_mmap(
+  dis_data_mmap <- DAST::prepare_data_mmap(
     polygon_shapefile_list = poly_list,
     aggregation_rasters_list = offset_list,
     mesh_args = list(
@@ -310,7 +310,7 @@ plot(dis_data_mmap)
 
 ```{r priors, echo=TRUE}
 
-my_priors <- disaggMultiMap::get_priors(dis_data_mmap)
+my_priors <- DAST::get_priors(dis_data_mmap)
 my_priors$prior_rho_min <- 25000
 my_priors$prior_rho_prob <- 0.5
 my_priors$prior_iideffect_sd_max <- 0.1
@@ -320,15 +320,15 @@ my_priors$prior_iideffect_sd_prob <- 0.5
 
 
 ```{r fit-pooled, cache=TRUE}
-fm_nb_k1_pooled_priros <- disaggMultiMap::disag_model_mmap(
+fm_nb_k1_pooled_priros <- DAST::disag_model_mmap(
   data = dis_data_mmap,
-  aghq_k = 2,
   family = "negbinomial",
   link = "log",
   iid = TRUE,
   verbose = TRUE,
   priors = my_priors,
   engine = "AGHQ",
+    engine.args = list(aghq_k = 2),
   time_varying_betas = FALSE
 )
 ```
@@ -344,7 +344,7 @@ predMaskWrap = terra::wrap(pred_mask)
 
 ```{r post-sampling, eval=exists('fm_nb_k1_pooled_priros'), cache=TRUE}
 samps <- aghq::sample_marginal(fm_nb_k1_pooled_priros$aghq_model, 500)
-mats <- disaggMultiMap:::get_predict_matrices(
+mats <- DAST:::get_predict_matrices(
   data = fm_nb_k1_pooled_priros$data,
   new_data = NULL,
   expected_cov_names = tryCatch(
@@ -516,15 +516,15 @@ cc
 
 ```{r fit-timevarying, cache=TRUE, eval=FALSE}
 # does'nt work
-fm_nb_k1 <- disaggMultiMap::disag_model_mmap(
+fm_nb_k1 <- DAST::disag_model_mmap(
   data = dis_data_mmap,
-  aghq_k = 1,
   family = "negbinomial",
   link = "log",
   iid = TRUE,
   verbose = TRUE,
   priors = my_priors,
   engine = "AGHQ",
+  engine.args = list(aghq_k = 1),
   time_varying_betas = TRUE
 )
 ```

@@ -704,13 +704,15 @@ my_priors$prior_iideffect_sd_prob <- 0.5
 ```{r fit-pooled-nb, cache=TRUE}
 fm_nb_pooled <- DAST::disag_model_mmap(
   data = dis_data_mmap,
-  aghq_k = 2,
   family = "negbinomial",
   link = "log",
   iid = TRUE,
   verbose = TRUE,
   priors = my_priors,
   engine = "AGHQ",
+  engine.args = list(
+    aghq_k = 2,
+  ),
   time_varying_betas = TRUE
 )
 ```
