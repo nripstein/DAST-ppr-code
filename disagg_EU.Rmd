@@ -1,13 +1,12 @@
 ---
 title: "Disaggregation Workflow (Noah/Patrick)"
-output: pdf_document
-header-includes:
-  - |
-    ```{=latex}
-    \expandafter\def\csname ver@subfig.sty\endcsname{}
-    \usepackage{graphicx,subcaption}
-    \makeatletter\@ifundefined{subfloat}{\newcommand{\subfloat}[2][need a sub-caption]{\subcaptionbox{#1}{#2} }}{\renewcommand{\subfloat}[2][need a sub-caption]{\subcaptionbox{#1}{#2} }}\makeatother
-    ```
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+header-includes: "```{=latex}\n\\usepackage{graphicx,subcaption}\n\\makeatletter\\@ifundefined{subfloat}{\\newcommand{\\subfloat}[2][need
+  a sub-caption]{\\subcaptionbox{#1}{#2} }}{\\renewcommand{\\subfloat}[2][need a sub-caption]{\\subcaptionbox{#1}{#2}
+  }}\\makeatother\n```\n"
 ---
 
 ```{r setup, include=FALSE}
@@ -182,13 +181,18 @@ names(nutsAll) <- Syears
 
 nuts <- lapply(nutsAll, function(x) x[x$CNTR_CODE %in% c("NL", "BE") & x$LEVL_CODE == 3, ])
 
-nutsYear <- list(
-  "2018" = nuts[["2016"]],
-  "2019" = nuts[["2016"]],
-  "2020" = nuts[["2021"]],
-  "2021" = nuts[["2021"]],
-  "2022" = nuts[["2021"]],
-  "2023" = nuts[["2024"]]
+# nutsYear <- list(
+#   "2018" = nuts[["2016"]],
+#   "2019" = nuts[["2016"]],
+#   "2020" = nuts[["2021"]],
+#   "2021" = nuts[["2021"]],
+#   "2022" = nuts[["2021"]],
+#   "2023" = nuts[["2024"]]
+# )
+nutsYear <- c(
+  setNames(rep(list(nuts[["2016"]]), 2), 2015:2016),
+  setNames(rep(list(nuts[["2021"]]), 6), 2017:2022),
+  list("2023" = nuts[["2024"]])
 )
 
 mort <- eurostat::get_eurostat("demo_r_magec3", type = "code", cache_dir = data_dir)
@@ -231,6 +235,7 @@ popT1 <- terra::project(pop, terra::crs(nuts[[1]]))
 pop_file <- file.path(data_dir, paste0("pop_", res_choice, ".tif"))
 popT <- terra::writeRaster(popT1, pop_file, overwrite = TRUE)
 popT <- terra::rast(pop_file)
+stopifnot(!anyNA(unlist(lapply(nutsYear, function(x) x$deaths))))
 
 mort1 <- as.data.frame(mort[mort$unit == "NR" & mort$age == "Y_LT5" & mort$sex == "F", ])
 for (D in names(nutsYear)) {
@@ -255,7 +260,8 @@ data("worldMap", package = "mapmisc")
 world <- terra::unwrap(worldMap)
 worldT <- terra::project(world, terra::crs(nuts[[1]]))
 
-nuts3 <- nutsYear[c(1, 3, 6)]
+# nuts3 <- nutsYear[c(1, 3, 6)]
+nuts3 <- nutsYear[c("2015", "2017", "2023")]
 Scol <- c("lightblue", "green", "blue")
 Slwd <- seq(2, 0.8, len = length(nuts3))^2
 Slty <- rep(1, length(nuts3))
@@ -269,7 +275,7 @@ legend("topleft", lwd = 3, col = Scol, legend = names(nuts3), bty = "n", inset =
 
 
 
-```{r build-disagg-data, cache=TRUE}
+```{r build-disagg-data, cache=FALSE}
 poly_list <- lapply(nutsYear, sf::st_as_sf)
 offset_list <- setNames(lapply(names(popT), function(nm) popT[[nm]]), sub("^X", "", names(popT)))
 
@@ -319,7 +325,7 @@ my_priors$prior_iideffect_sd_prob <- 0.5
 
 
 
-```{r fit-pooled, cache=TRUE}
+```{r fit-pooled, cache=FALSE}
 fm_nb_k1_pooled_priros <- DAST::disag_model_mmap(
   data = dis_data_mmap,
   family = "negbinomial",
@@ -342,7 +348,8 @@ predMaskWrap = terra::wrap(pred_mask)
 ```
 
 
-```{r post-sampling, eval=exists('fm_nb_k1_pooled_priros'), cache=TRUE}
+```{r post-sampling, cache=FALSE}
+set.seed(1)
 samps <- aghq::sample_marginal(fm_nb_k1_pooled_priros$aghq_model, 500)
 mats <- DAST:::get_predict_matrices(
   data = fm_nb_k1_pooled_priros$data,
@@ -370,7 +377,7 @@ aa
 
 
 ```{r pooled-maps, fig.cap='stuff', out.width='0.5\\textwidth'}
-# pred_mask = terra::unwrap(predMaskWrap)
+pred_mask = terra::unwrap(predMaskWrap)
 pred_col <- mapmisc::colourScale(
   pred_mask[["med"]],
   dec = 2,
@@ -388,7 +395,7 @@ mapmisc::legendBreaks("topleft", pred_col, bty = "n")
 
 
 
-```{r prior-posterior-export, eval=exists('fm_nb_k1_pooled_priros')}
+```{r prior-posterior-export}
 plots_priors <- plot_priors_posteriors_manual(fm_nb_k1_pooled_priros)
 par_plot_split <- split(plots_priors$df, plots_priors$df$param)
 par_plot_split2 <- lapply(
@@ -400,7 +407,7 @@ par_plot_split2 <- lapply(
 ```
 
 
-```{r plotPriorPost, eval=exists('par_plot_split2'), fig.cap = 'Priors and posteriors', fig.subcap = c('nb','range','spatial sd'), dev='pdf', out.width='0.31\\textwidth', fig.height=3, fig.width=3}
+```{r plotPriorPost, fig.cap = 'Priors and posteriors', fig.subcap = c('nb','range','spatial sd'), dev='pdf', out.width='0.31\\textwidth', fig.height=3, fig.width=3}
 par(mar = c(2, 4, 0.5, 0))
 matplot(
   par_plot_split2$NB$x,
