@@ -321,6 +321,7 @@ my_priors$prior_rho_min <- 25000
 my_priors$prior_rho_prob <- 0.5
 my_priors$prior_iideffect_sd_max <- 0.1
 my_priors$prior_iideffect_sd_prob <- 0.5
+my_priors$prior_sigma_max <- 1
 ```
 
 
@@ -335,7 +336,8 @@ fm_nb_k1_pooled_priros <- DAST::disag_model_mmap(
   priors = my_priors,
   engine = "AGHQ",
     engine.args = list(aghq_k = 2),
-  time_varying_betas = FALSE
+  time_varying_betas = FALSE,
+  fixed_effect_betas = FALSE   # intercept integrated in inner Laplace: theta = (tau, sigma, rho)
 )
 ```
 
@@ -360,7 +362,10 @@ mats <- DAST:::get_predict_matrices(
   time_varying_betas = isTRUE(fm_nb_k1_pooled_priros$model_setup$time_varying_betas)
 )
 
-rfield <- mats$A %*% samps$samps
+# intercept is now a random effect, so keep only the spatial field rows
+is_field <- fm_nb_k1_pooled_priros$model_setup$random_order == "nodemean"
+stopifnot(sum(is_field) == ncol(mats$A))
+rfield <- mats$A %*% samps$samps[is_field, ]
 res_k1 <- rast(
   as.data.frame(cbind(
     mats$coords,
@@ -514,6 +519,63 @@ mapmisc::map.new(vecpoints, buffer = c(0, 100*1000))
 plot(bordersT, add = TRUE, col='white', border='grey')
 points(vecpoints, pch = 15, cex = 0.4)
 
+```
+
+## Numbers for the paper
+
+```{r paper-numbers, echo=TRUE}
+fit <- fm_nb_k1_pooled_priros
+pr  <- fit$obj$env$data   # priors actually used in the fit
+
+## Quadrature: dimension of theta and number of AGHQ points
+theta_names <- names(fit$aghq_model$optresults$mode)
+theta_names
+c(dim_theta = length(theta_names),
+  n_quad    = nrow(fit$aghq_model$normalized_posterior$nodesandweights))
+
+## Posteriors on natural scale (tau, sigma, range in km)
+s <- summary(fit$aghq_model, max_print = 0)$summarytable
+post <- exp(s[grep("tau|sigma|rho", rownames(s)), c("2.5%", "median", "97.5%")])
+is_rho <- grepl("rho", rownames(post))
+post[is_rho, ] <- post[is_rho, ] / 1000
+round(post, 3)
+
+## Priors: same quantiles, from the PC prior parameters
+lam_tau <- -log(pr$prior_iideffect_sd_prob) / pr$prior_iideffect_sd_max
+lam_sig <- -log(pr$prior_sigma_prob) / pr$prior_sigma_max
+lam_rho <- -log(pr$prior_rho_prob) * pr$prior_rho_min
+q <- c(0.025, 0.5, 0.975)
+prior_tab <- rbind(
+  tau      = qexp(q, lam_tau),
+  sigma    = qexp(q, lam_sig),
+  range_km = -lam_rho / log(q) / 1000   # Pr(rho < r) = exp(-lam / r)
+)
+colnames(prior_tab) <- c("2.5%", "median", "97.5%")
+signif(prior_tab, 3)
+c(prior_Pr_sigma_gt_1.5 = exp(-lam_sig * 1.5))
+
+## Relative risk and exceedance over the study region
+rr  <- exp(terra::values(pred_mask$med, na.rm = TRUE))
+exc <- terra::values(pred_mask$exc, na.rm = TRUE)
+round(range(rr), 2)
+round(range(exc), 3)
+pct <- function(x) round(100 * mean(x), 2)
+c(exc_gt_0.95   = pct(exc > 0.95),
+  exc_lt_0.05   = pct(exc < 0.05),
+  exc_0.2_0.8   = pct(exc >= 0.2 & exc <= 0.8))
+
+## RR extremes by country
+sapply(c("Belgium", "Netherlands"), function(cn) {
+  m <- terra::mask(pred_mask$med, bordersT[bordersT$COUNTRY == cn, ])
+  round(exp(terra::minmax(m)[, 1]), 2)
+})
+
+## Where the extremes are (lon/lat), to check "near Antwerp" etc.
+v <- terra::values(pred_mask$med)
+cells <- c(max_rr = which.max(v), min_rr = which.min(v))
+pts <- terra::vect(terra::xyFromCell(pred_mask, cells), crs = terra::crs(pred_mask))
+data.frame(which = names(cells),
+           round(terra::geom(terra::project(pts, "EPSG:4326"))[, c("x", "y")], 2))
 ```
 
 
