@@ -1,3 +1,8 @@
 /data/*
 !/data/.gitkeep
 paper/
+.Rhistory
+cache/
+output/
+vignette_manchester.md
+vignette_manchester_files/
